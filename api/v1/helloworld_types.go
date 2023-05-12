@@ -44,8 +44,8 @@ type HelloWorldStatus struct {
 
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
-//+kubebuilder:printcolumn:JSONPath=".spec.size",name=Component,type=string
-//+kubebuilder:printcolumn:JSONPath=".spec.text",name=Component,type=string
+//+kubebuilder:printcolumn:JSONPath=".spec.size",name=Size,type=int32
+//+kubebuilder:printcolumn:JSONPath=".spec.text",name=Text,type=string
 
 // HelloWorld is the Schema for the helloworlds API
 type HelloWorld struct {
