@@ -19,6 +19,11 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,15 +36,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	opeartorv1 "github.com/HuberyChang/hello-world-operator/api/v1"
-	//apierrors "k8s.io/apimachinery/pkg/api/errors"
+	// apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 const helloworldFinalizer = "operator.example.com/finalizer"
 
-//typeAvailableHelloWorld 表示 Deployment 解耦的状态。
+// typeAvailableHelloWorld 表示 Deployment 解耦的状态。
 const typeAvailableHelloWorld = "Available"
 
-//typeDegradedHelloWorld 表示当自定义资源被删除时必须发生的终结器操作的状态。
+// typeDegradedHelloWorld 表示当自定义资源被删除时必须发生的终结器操作的状态。
 const typeDegradedHelloWorld = "Degraded"
 
 // HelloWorldReconciler reconciles a HelloWorld object
@@ -78,8 +83,10 @@ func (r *HelloWorldReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	if helloworld.Status.Conditions == nil || len(helloworld.Status.Conditions) == 0 {
-		meta.SetStatusCondition(&helloworld.Status.Conditions, metav1.Condition{Type: typeAvailableHelloWorld, Status: metav1.ConditionUnknown,
-			Reason: "Reconciling", Message: "Starting reconciliation"})
+		meta.SetStatusCondition(&helloworld.Status.Conditions, metav1.Condition{
+			Type: typeAvailableHelloWorld, Status: metav1.ConditionUnknown,
+			Reason: "Reconciling", Message: "Starting reconciliation",
+		})
 		if err = r.Status().Update(ctx, helloworld); err != nil {
 			logger.Error(err, "Failed to update HelloWorld status")
 			return ctrl.Result{}, err
@@ -108,8 +115,10 @@ func (r *HelloWorldReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if isHelloWorldMarkedToBeDeleted {
 		if controllerutil.ContainsFinalizer(helloworld, helloworldFinalizer) {
 			logger.Info("Performing finalizer operations for HelloWorld before delete CR")
-			meta.SetStatusCondition(&helloworld.Status.Conditions, metav1.Condition{Type: typeDegradedHelloWorld, Status: metav1.ConditionUnknown,
-				Reason: "Finalizing", Message: fmt.Sprintf("Performing finalizer operations for the custom resource: %s", helloworld.Name)})
+			meta.SetStatusCondition(&helloworld.Status.Conditions, metav1.Condition{
+				Type: typeDegradedHelloWorld, Status: metav1.ConditionUnknown,
+				Reason: "Finalizing", Message: fmt.Sprintf("Performing finalizer operations for the custom resource: %s", helloworld.Name),
+			})
 
 			if err := r.Status().Update(ctx, helloworld); err != nil {
 				logger.Error(err, "Failed to update HelloWorld status")
@@ -123,9 +132,11 @@ func (r *HelloWorldReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				return ctrl.Result{}, err
 			}
 
-			meta.SetStatusCondition(&helloworld.Status.Conditions, metav1.Condition{Type: typeDegradedHelloWorld, Status: metav1.ConditionTrue,
+			meta.SetStatusCondition(&helloworld.Status.Conditions, metav1.Condition{
+				Type: typeDegradedHelloWorld, Status: metav1.ConditionTrue,
 				Reason: "Finalizing", Message: fmt.Sprintf("Finalizer operations for custom resource %s name were successfully accomplished",
-					helloworld.Name)})
+					helloworld.Name),
+			})
 
 			if err := r.Status().Update(ctx, helloworld); err != nil {
 				logger.Error(err, "Failed to update HelloWorld status")
@@ -152,6 +163,95 @@ func (r *HelloWorldReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 func (r *HelloWorldReconciler) doFinalizerOperationsForHelloWorld(hd *opeartorv1.HelloWorld) {
 	r.Recorder.Event(hd, "Warning", "Deleting", fmt.Sprintf("Custom Resource %s is being deleted from the namespace %s", hd.Name, hd.Namespace))
+}
+
+// deploymentForHelloWorld返回一个HelloWorld Deployment对象
+func (r *HelloWorldReconciler) deploymentForHelloWorld(helloworld *opeartorv1.HelloWorld) (*appsv1.Deployment, error) {
+	labels := labelsForHelloWorld(helloworld.Name)
+	replicas := helloworld.Spec.Size
+
+	image, err := imagesForHelloWorld()
+	if err != nil {
+		return nil, err
+	}
+
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      helloworld.Name,
+			Namespace: helloworld.Namespace,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labels,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labels,
+				},
+				Spec: corev1.PodSpec{
+					SecurityContext: &corev1.PodSecurityContext{
+						RunAsNonRoot: &[]bool{true}[0],
+						SeccompProfile: &corev1.SeccompProfile{
+							Type: corev1.SeccompProfileTypeRuntimeDefault,
+						},
+					},
+					Containers: []corev1.Container{
+						{
+							Image:           image,
+							Name:            "helloworld",
+							ImagePullPolicy: corev1.PullIfNotPresent,
+							Env: []corev1.EnvVar{
+								{
+									Name:  "HELLO_TEXT",
+									Value: helloworld.Spec.Text,
+								},
+							},
+							SecurityContext: &corev1.SecurityContext{
+								RunAsNonRoot:             &[]bool{true}[0],
+								AllowPrivilegeEscalation: &[]bool{false}[0],
+								Capabilities: &corev1.Capabilities{
+									Drop: []corev1.Capability{
+										"ALL",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if err := ctrl.SetControllerReference(helloworld, dep, r.Scheme); err != nil {
+		return nil, err
+	}
+
+	return dep, nil
+}
+
+func labelsForHelloWorld(name string) map[string]string {
+	var imageTag string
+	image, err := imagesForHelloWorld()
+	if err != nil {
+		imageTag = strings.Split(image, ":")[1]
+	}
+	return map[string]string{
+		"app.k8s.io/instance":   name,
+		"app.k8s.io/version":    imageTag,
+		"app.k8s.io/part-of":    "hello-world-operator",
+		"app.k8s.io/created-by": "controller-manager",
+	}
+}
+
+// imageForHelloWorld函数从HELLWORLD_IMAGE环境变量中获取由该控制器管理的operand(操作对象)镜像,该环境变量定义在config/manager/manager.yaml中
+func imagesForHelloWorld() (string, error) {
+	imageEnvVar := "HELLOWORLD_IMAGE"
+	image, found := os.LookupEnv(imageEnvVar)
+	if !found {
+		return "", fmt.Errorf("Unable to find %s environment variable with the image", imageEnvVar)
+	}
+	return image, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
