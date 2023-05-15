@@ -21,6 +21,11 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
+
+	"k8s.io/apimachinery/pkg/util/intstr"
+
+	"k8s.io/apimachinery/pkg/types"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -158,9 +163,116 @@ func (r *HelloWorldReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, nil
 	}
 
+	foundDeployment := &appsv1.Deployment{}
+	err = r.Get(ctx, types.NamespacedName{Name: helloworld.Name, Namespace: helloworld.Namespace}, foundDeployment)
+	if err != nil && errors.IsNotFound(err) {
+		dep, err := r.deploymentForHelloWorld(helloworld)
+		if err != nil {
+			logger.Error(err, "Failed to define new Deployment resource for HelloWorld")
+			meta.SetStatusCondition(&helloworld.Status.Conditions, metav1.Condition{
+				Type: typeAvailableHelloWorld, Status: metav1.ConditionFalse,
+				Reason: "Reconciling", Message: fmt.Sprintf("Failed to create Deployment for the custom resource (%s): (%s)", helloworld.Name, err),
+			})
+
+			if err := r.Status().Update(ctx, helloworld); err != nil {
+				logger.Error(err, "Failed to update HelloWorld status")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, err
+		}
+
+		logger.Info("Creating a new Deployment", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
+		if err = r.Create(ctx, dep); err != nil {
+			logger.Error(err, "Failed to create new Deployment", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{RequeueAfter: time.Second * 30}, nil
+	} else if err != nil {
+		logger.Error(err, "Failed to get deployment")
+		return ctrl.Result{}, err
+	}
+
+	size := helloworld.Spec.Size
+	text := helloworld.Spec.Text
+	foundContainer := &foundDeployment.Spec.Template.Spec.Containers[0]
+	if *foundDeployment.Spec.Replicas != size || len(foundContainer.Env) != 1 || foundContainer.Env[0].Value != text {
+		foundDeployment.Spec.Replicas = &size
+		foundContainer.Env = []corev1.EnvVar{
+			{
+				Name:  "HELLO_TEXT",
+				Value: helloworld.Spec.Text,
+			},
+		}
+		logger.Info("Updating Deployment", "Deployment.Namespace", foundDeployment.Namespace, "Deployment.Name", foundDeployment.Name)
+
+		if err = r.Update(ctx, foundDeployment); err != nil {
+			logger.Error(err, "Failed to update Deployment", "Deployment.Namespace", foundDeployment.Namespace, "Deployment.Name", foundDeployment.Name)
+
+			if err = r.Get(ctx, req.NamespacedName, helloworld); err != nil {
+				logger.Error(err, "Failed to re-fetch helloworld")
+				return ctrl.Result{}, err
+			}
+
+			meta.SetStatusCondition(&helloworld.Status.Conditions, metav1.Condition{
+				Type: typeAvailableHelloWorld, Status: metav1.ConditionFalse,
+				Reason: "Resizing", Message: fmt.Sprintf("Failed to update the size for the custom resource (%s): (%s)", helloworld.Name, err),
+			})
+
+			if err := r.Status().Update(ctx, helloworld); err != nil {
+				logger.Error(err, "Failed to update HelloWorld status")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	foundSvc := &corev1.Service{}
+	err = r.Get(ctx, types.NamespacedName{Name: helloworld.Name, Namespace: helloworld.Namespace}, foundSvc)
+	if err != nil && errors.IsNotFound(err) {
+		svc, err := r.serviceForHelloWorld(helloworld)
+		if err != nil {
+			logger.Error(err, "Failed to define new Service resource for HelloWorld")
+			meta.SetStatusCondition(&helloworld.Status.Conditions, metav1.Condition{
+				Type: typeAvailableHelloWorld, Status: metav1.ConditionFalse,
+				Reason: "Reconciling", Message: fmt.Sprintf("Failed to create Service for the custom resource (%s): (%s)", helloworld.Name, err),
+			})
+
+			if err := r.Status().Update(ctx, helloworld); err != nil {
+				logger.Error(err, "Failed to update HelloWorld status")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, err
+		}
+
+		logger.Info("Creating a new Service", "Service.Namespace", svc.Namespace, "Service.Name", svc.Name)
+		if err = r.Create(ctx, svc); err != nil {
+			logger.Error(err, "Failed to create new Service", "Service.Namespace", svc.Namespace, "Service.Name", svc.Name)
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{RequeueAfter: time.Second * 30}, nil
+	} else if err != nil {
+		logger.Error(err, "Failed to get Service")
+		// Let's return the error for the reconciliation be re-trigged again
+		return ctrl.Result{}, err
+	}
+
+	meta.SetStatusCondition(&helloworld.Status.Conditions, metav1.Condition{
+		Type: typeAvailableHelloWorld, Status: metav1.ConditionTrue,
+		Reason: "Reconciling", Message: fmt.Sprintf("Deployment for custom resource (%s) with %d replicas created successfully", helloworld.Name, size),
+	})
+
+	if err := r.Status().Update(ctx, helloworld); err != nil {
+		logger.Error(err, "Failed to update HelloWorld status")
+		return ctrl.Result{}, err
+	}
+
 	return ctrl.Result{}, nil
 }
 
+// finalizeHelloWorld 将在删除自定义资源前执行必要的操作
 func (r *HelloWorldReconciler) doFinalizerOperationsForHelloWorld(hd *opeartorv1.HelloWorld) {
 	r.Recorder.Event(hd, "Warning", "Deleting", fmt.Sprintf("Custom Resource %s is being deleted from the namespace %s", hd.Name, hd.Namespace))
 }
@@ -192,9 +304,11 @@ func (r *HelloWorldReconciler) deploymentForHelloWorld(helloworld *opeartorv1.He
 				Spec: corev1.PodSpec{
 					SecurityContext: &corev1.PodSecurityContext{
 						RunAsNonRoot: &[]bool{true}[0],
-						SeccompProfile: &corev1.SeccompProfile{
-							Type: corev1.SeccompProfileTypeRuntimeDefault,
-						},
+						//通过Security Context为Pod和容器设置Seccomp Profile,以控制容器可以使用的系统调用,进而提高其安全性
+						//seccomProfile 是在Kubernetes 1.19中引入的，如果要支持较低版本的Kubernetes,则不能使用Seccomp Profile,需要在Yaml清单中删除此配置项。
+						//SeccompProfile: &corev1.SeccompProfile{
+						//	Type: corev1.SeccompProfileTypeRuntimeDefault,
+						//},
 					},
 					Containers: []corev1.Container{
 						{
@@ -207,6 +321,7 @@ func (r *HelloWorldReconciler) deploymentForHelloWorld(helloworld *opeartorv1.He
 									Value: helloworld.Spec.Text,
 								},
 							},
+							// 为容器设置一定的安全上下文,以限制其权限,从而减少风险
 							SecurityContext: &corev1.SecurityContext{
 								RunAsNonRoot:             &[]bool{true}[0],
 								AllowPrivilegeEscalation: &[]bool{false}[0],
@@ -222,7 +337,8 @@ func (r *HelloWorldReconciler) deploymentForHelloWorld(helloworld *opeartorv1.He
 			},
 		},
 	}
-
+	// 为Deployment设置ownerReference
+	// 表示要通过ownerReference字段建立Deployment与其子资源(如ReplicaSet、Pod)之间的父子关系,这样可以实现资源间的生命周期和其他属性的关联管理
 	if err := ctrl.SetControllerReference(helloworld, dep, r.Scheme); err != nil {
 		return nil, err
 	}
@@ -230,6 +346,32 @@ func (r *HelloWorldReconciler) deploymentForHelloWorld(helloworld *opeartorv1.He
 	return dep, nil
 }
 
+func (r *HelloWorldReconciler) serviceForHelloWorld(helloworld *opeartorv1.HelloWorld) (*corev1.Service, error) {
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      helloworld.Name,
+			Namespace: helloworld.Namespace,
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: labelsForHelloWorld(helloworld.Name),
+			Ports: []corev1.ServicePort{
+				{
+					Protocol:   "TCP",
+					Port:       8080,
+					TargetPort: intstr.FromInt(8080),
+				},
+			},
+		},
+	}
+
+	if err := ctrl.SetControllerReference(helloworld, svc, r.Scheme); err != nil {
+		return nil, err
+	}
+
+	return svc, nil
+}
+
+// 返回用于选择资源的标签
 func labelsForHelloWorld(name string) map[string]string {
 	var imageTag string
 	image, err := imagesForHelloWorld()
@@ -249,14 +391,16 @@ func imagesForHelloWorld() (string, error) {
 	imageEnvVar := "HELLOWORLD_IMAGE"
 	image, found := os.LookupEnv(imageEnvVar)
 	if !found {
-		return "", fmt.Errorf("Unable to find %s environment variable with the image", imageEnvVar)
+		return "", fmt.Errorf("unable to find %s environment variable with the image", imageEnvVar)
 	}
 	return image, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
+// Note：Deployment也将被监视以确保其在集群上的理想状态
 func (r *HelloWorldReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&opeartorv1.HelloWorld{}).
+		Owns(&appsv1.Deployment{}).
 		Complete(r)
 }
