@@ -91,22 +91,28 @@ func (r *HelloWorldReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
+	// 当状态不可用时,我们就将状态设置为“未知”
 	if helloworld.Status.Conditions == nil || len(helloworld.Status.Conditions) == 0 {
 		meta.SetStatusCondition(&helloworld.Status.Conditions, metav1.Condition{
-			Type: typeAvailableHelloWorld, Status: metav1.ConditionUnknown,
-			Reason: "Reconciling", Message: "Starting reconciliation",
+			Type:    typeAvailableHelloWorld,
+			Status:  metav1.ConditionUnknown,
+			Reason:  "Reconciling",
+			Message: "Starting reconciliation",
 		})
 		if err = r.Status().Update(ctx, helloworld); err != nil {
 			logger.Error(err, "Failed to update HelloWorld status")
 			return ctrl.Result{}, err
 		}
 
+		// 在更新状态后,我们重新获取helloworld自定义资源,这样我们可以在集群上获得该资源的最新状态,并避免出现“对象已被修改,请将您的更改应用于最新版本并重试”的问题
+		// 如果我们再次尝试在以下操作中更新它,它会再次触发调节
 		if err := r.Get(ctx, req.NamespacedName, helloworld); err != nil {
 			logger.Error(err, "Failed to re-fetch helloworld")
 			return ctrl.Result{}, err
 		}
 	}
 
+	// 添加一个终结器。 然后,我们可以定义一些操作,这些操作应该在自定义资源被删除之前发生
 	if !controllerutil.ContainsFinalizer(helloworld, helloworldFinalizer) {
 		logger.Info("Adding Finalizer for HelloWorld")
 		if ok := controllerutil.AddFinalizer(helloworld, helloworldFinalizer); !ok {
@@ -120,13 +126,18 @@ func (r *HelloWorldReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
+	// 检查HelloWorld实例是否标记为删除,这由设置的deletion timestamp表示
 	isHelloWorldMarkedToBeDeleted := helloworld.GetDeletionTimestamp() != nil
 	if isHelloWorldMarkedToBeDeleted {
 		if controllerutil.ContainsFinalizer(helloworld, helloworldFinalizer) {
 			logger.Info("Performing finalizer operations for HelloWorld before delete CR")
+
+			// 在这里添加一个状态“降级”，以定义该资源开始其被终止的进程
 			meta.SetStatusCondition(&helloworld.Status.Conditions, metav1.Condition{
-				Type: typeDegradedHelloWorld, Status: metav1.ConditionUnknown,
-				Reason: "Finalizing", Message: fmt.Sprintf("Performing finalizer operations for the custom resource: %s", helloworld.Name),
+				Type:    typeDegradedHelloWorld,
+				Status:  metav1.ConditionUnknown,
+				Reason:  "Finalizing",
+				Message: fmt.Sprintf("Performing finalizer operations for the custom resource: %s", helloworld.Name),
 			})
 
 			if err := r.Status().Update(ctx, helloworld); err != nil {
@@ -134,6 +145,7 @@ func (r *HelloWorldReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				return ctrl.Result{}, err
 			}
 
+			// 在删除终结器和允许Kubernetes API删除自定义资源之前执行所有必需的操作
 			r.doFinalizerOperationsForHelloWorld(helloworld)
 
 			if err := r.Get(ctx, req.NamespacedName, helloworld); err != nil {
@@ -142,9 +154,10 @@ func (r *HelloWorldReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			}
 
 			meta.SetStatusCondition(&helloworld.Status.Conditions, metav1.Condition{
-				Type: typeDegradedHelloWorld, Status: metav1.ConditionTrue,
-				Reason: "Finalizing", Message: fmt.Sprintf("Finalizer operations for custom resource %s name were successfully accomplished",
-					helloworld.Name),
+				Type:    typeDegradedHelloWorld,
+				Status:  metav1.ConditionTrue,
+				Reason:  "Finalizing",
+				Message: fmt.Sprintf("Finalizer operations for custom resource %s name were successfully accomplished", helloworld.Name),
 			})
 
 			if err := r.Status().Update(ctx, helloworld); err != nil {
@@ -167,15 +180,19 @@ func (r *HelloWorldReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, nil
 	}
 
+	// 检查deployment是否已经存在,如果不存在则创建一个新的
 	foundDeployment := &appsv1.Deployment{}
 	err = r.Get(ctx, types.NamespacedName{Name: helloworld.Name, Namespace: helloworld.Namespace}, foundDeployment)
 	if err != nil && errors.IsNotFound(err) {
+		// 定义一个新的deployment
 		dep, err := r.deploymentForHelloWorld(helloworld)
 		if err != nil {
 			logger.Error(err, "Failed to define new Deployment resource for HelloWorld")
 			meta.SetStatusCondition(&helloworld.Status.Conditions, metav1.Condition{
-				Type: typeAvailableHelloWorld, Status: metav1.ConditionFalse,
-				Reason: "Reconciling", Message: fmt.Sprintf("Failed to create Deployment for the custom resource (%s): (%s)", helloworld.Name, err),
+				Type:    typeAvailableHelloWorld,
+				Status:  metav1.ConditionFalse,
+				Reason:  "Reconciling",
+				Message: fmt.Sprintf("Failed to create Deployment for the custom resource (%s): (%s)", helloworld.Name, err),
 			})
 
 			if err := r.Status().Update(ctx, helloworld); err != nil {
@@ -191,8 +208,10 @@ func (r *HelloWorldReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			return ctrl.Result{}, err
 		}
 
+		// deployment成功创建，我们将重新排队调节,以便我们可以确保状态并为下一步操作前进
 		return ctrl.Result{RequeueAfter: time.Second * 30}, nil
 	} else if err != nil {
+		// 返回错误,再次触发调解
 		logger.Error(err, "Failed to get deployment")
 		return ctrl.Result{}, err
 	}
@@ -213,14 +232,18 @@ func (r *HelloWorldReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if err = r.Update(ctx, foundDeployment); err != nil {
 			logger.Error(err, "Failed to update Deployment", "Deployment.Namespace", foundDeployment.Namespace, "Deployment.Name", foundDeployment.Name)
 
+			// 更新状态之前重新获取helloworld自定义资源,在集群上获得该资源的最新状态,并避免出现“对象已被修改,请将您的更改应用于最新版本并重试”问题
+			// 这会再次触发调节
 			if err = r.Get(ctx, req.NamespacedName, helloworld); err != nil {
 				logger.Error(err, "Failed to re-fetch helloworld")
 				return ctrl.Result{}, err
 			}
 
 			meta.SetStatusCondition(&helloworld.Status.Conditions, metav1.Condition{
-				Type: typeAvailableHelloWorld, Status: metav1.ConditionFalse,
-				Reason: "Resizing", Message: fmt.Sprintf("Failed to update the size for the custom resource (%s): (%s)", helloworld.Name, err),
+				Type:    typeAvailableHelloWorld,
+				Status:  metav1.ConditionFalse,
+				Reason:  "Resizing",
+				Message: fmt.Sprintf("Failed to update the size for the custom resource (%s): (%s)", helloworld.Name, err),
 			})
 
 			if err := r.Status().Update(ctx, helloworld); err != nil {
@@ -229,6 +252,8 @@ func (r *HelloWorldReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			}
 			return ctrl.Result{}, err
 		}
+
+		// 现在,我们更新想重新队列调节的大小,这样我们可以确保在更新之前我们有资源的最新状态，有助于确保集群上的期望状态
 		return ctrl.Result{Requeue: true}, nil
 	}
 
@@ -239,8 +264,10 @@ func (r *HelloWorldReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if err != nil {
 			logger.Error(err, "Failed to define new Service resource for HelloWorld")
 			meta.SetStatusCondition(&helloworld.Status.Conditions, metav1.Condition{
-				Type: typeAvailableHelloWorld, Status: metav1.ConditionFalse,
-				Reason: "Reconciling", Message: fmt.Sprintf("Failed to create Service for the custom resource (%s): (%s)", helloworld.Name, err),
+				Type:    typeAvailableHelloWorld,
+				Status:  metav1.ConditionFalse,
+				Reason:  "Reconciling",
+				Message: fmt.Sprintf("Failed to create Service for the custom resource (%s): (%s)", helloworld.Name, err),
 			})
 
 			if err := r.Status().Update(ctx, helloworld); err != nil {
@@ -261,7 +288,7 @@ func (r *HelloWorldReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{RequeueAfter: time.Second * 30}, nil
 	} else if err != nil {
 		logger.Error(err, "Failed to get Service")
-		// Let's return the error for the reconciliation be re-trigged again
+		// 返回错误,使调解再次触发
 		return ctrl.Result{}, err
 	}
 
