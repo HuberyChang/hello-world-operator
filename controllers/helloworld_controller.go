@@ -62,6 +62,10 @@ type HelloWorldReconciler struct {
 //+kubebuilder:rbac:groups=opeartor.example.com,resources=helloworlds,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=opeartor.example.com,resources=helloworlds/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=opeartor.example.com,resources=helloworlds/finalizers,verbs=update
+//+kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
+//+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
+//+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -252,6 +256,8 @@ func (r *HelloWorldReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			return ctrl.Result{}, err
 		}
 
+		// Service创建成功
+		// 我们将重新排队调节,以确保状态，并继续执行下一个操作
 		return ctrl.Result{RequeueAfter: time.Second * 30}, nil
 	} else if err != nil {
 		logger.Error(err, "Failed to get Service")
